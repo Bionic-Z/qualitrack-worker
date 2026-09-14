@@ -9,7 +9,11 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
+<<<<<<< HEAD
   "type": "module",
+=======
+  "type": "commonjs",
+>>>>>>> b189068dfb0dc4d7d6fe0548fe2d2bca1923524e
   "dependencies": {
     "@google/generative-ai": "^0.24.1",
     "dotenv": "^17.4.2",
