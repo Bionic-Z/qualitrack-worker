@@ -9,7 +9,14 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-const BACKEND_WEBHOOK_URL = process.env.BACKEND_URL + '/webhooks/worker-update';
+// Las rutas del backend se montan en /api (backend/src/app.js), asi que el
+// webhook vive en /api/webhooks/worker-update. Se acepta BACKEND_URL con o sin
+// el /api final: sin esto el worker manda los estados a un 404 y el usuario ve
+// el analisis congelado sin ningun error visible.
+const BACKEND_WEBHOOK_URL =
+    String(process.env.BACKEND_URL || '')
+        .replace(/\/+$/, '')
+        .replace(/\/api$/, '') + '/api/webhooks/worker-update';
 
 // La llave se valida al arrancar: si está mal, es mejor no levantar el worker
 // que aceptar documentos y fallar al descifrarlos uno por uno.
