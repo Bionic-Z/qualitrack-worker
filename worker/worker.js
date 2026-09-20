@@ -66,7 +66,31 @@ app.get('/health', async (_req, res) => {
     });
 });
 
-app.post('/api/analyze', async (req, res) => {
+// El worker se publica por un tunel para que Railway lo alcance, asi que
+// /api/analyze queda expuesto a internet. El payload va cifrado, pero sin
+// token cualquiera puede encolar trabajo en la GPU y provocar webhooks.
+function requireWorkerToken(req, res, next) {
+    const esperado = process.env.WORKER_API_TOKEN;
+
+    if (!esperado) {
+        console.warn('WORKER_API_TOKEN no definido: /api/analyze esta SIN autenticacion.');
+        return next();
+    }
+
+    const recibido = req.headers['x-worker-token'];
+
+    if (typeof recibido !== 'string' || recibido.length !== esperado.length) {
+        return res.status(401).json({ error: 'No autorizado' });
+    }
+
+    if (!crypto.timingSafeEqual(Buffer.from(recibido), Buffer.from(esperado))) {
+        return res.status(401).json({ error: 'No autorizado' });
+    }
+
+    return next();
+}
+
+app.post('/api/analyze', requireWorkerToken, async (req, res) => {
     // AHORA RECIBIMOS LOS SUBCRITERIOS DIRECTAMENTE DESDE EL SERVICIO A
     const { documentId, userId, iv, authTag, fileData, subcriteria, format } = req.body;
 
