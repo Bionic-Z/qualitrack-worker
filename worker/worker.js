@@ -13,10 +13,11 @@ app.use(express.json({ limit: '15mb' }));
 // webhook vive en /api/webhooks/worker-update. Se acepta BACKEND_URL con o sin
 // el /api final: sin esto el worker manda los estados a un 404 y el usuario ve
 // el analisis congelado sin ningun error visible.
-const BACKEND_WEBHOOK_URL =
-    String(process.env.BACKEND_URL || '')
-        .replace(/\/+$/, '')
-        .replace(/\/api$/, '') + '/api/webhooks/worker-update';
+const BACKEND_BASE = String(process.env.BACKEND_URL || '')
+    .replace(/\/+$/, '')
+    .replace(/\/api$/, '');
+
+const BACKEND_WEBHOOK_URL = BACKEND_BASE + '/api/webhooks/worker-update';
 
 // La llave se valida al arrancar: si está mal, es mejor no levantar el worker
 // que aceptar documentos y fallar al descifrarlos uno por uno.
@@ -91,10 +92,13 @@ function requireWorkerToken(req, res, next) {
 }
 
 app.post('/api/analyze', requireWorkerToken, async (req, res) => {
-    // AHORA RECIBIMOS LOS SUBCRITERIOS DIRECTAMENTE DESDE EL SERVICIO A
-    const { documentId, userId, iv, authTag, fileData, subcriteria, format } = req.body;
-
     res.status(202).json({ message: 'Documento en procesamiento' });
+    await procesarTrabajo(req.body);
+});
+
+/** Descifra, extrae, clasifica y reporta. Compartido por el bucle y el POST. */
+async function procesarTrabajo(job) {
+    const { documentId, userId, iv, authTag, fileData, subcriteria, format } = job;
 
     try {
         await sendStatusUpdate(documentId, 'RECEIVED_BY_ANALYZER');
@@ -146,7 +150,48 @@ app.post('/api/analyze', requireWorkerToken, async (req, res) => {
         console.error("Error en el Worker:", error);
         await sendStatusUpdate(documentId, 'ERROR', { error: error.message });
     }
-});
+}
+
+// ─── Bucle de sondeo ──────────────────────────────────────────────────────────
+//
+// El worker pregunta al backend si hay trabajo en vez de esperar conexiones.
+// Asi esta maquina no necesita IP estable, puertos abiertos, tunel ni VPN: solo
+// salida HTTPS, que cualquier conexion domestica tiene.
+
+const POLL_MS = Number(process.env.WORKER_POLL_MS || 5000);
+const JOBS_URL = BACKEND_BASE + '/api/worker/jobs';
+
+let sondeando = false;
+
+async function sondearTrabajo() {
+    // Un solo documento a la vez: la GPU no gana nada procesando en paralelo.
+    if (sondeando) return;
+    sondeando = true;
+
+    try {
+        const response = await fetch(JOBS_URL, {
+            headers: { 'x-worker-token': process.env.WORKER_API_TOKEN || '' },
+            signal: AbortSignal.timeout(60000),
+        });
+
+        // 204: no hay trabajo. Es el caso normal, no se registra.
+        if (response.status === 204) return;
+
+        if (!response.ok) {
+            console.warn(`[sondeo] El backend respondio ${response.status}`);
+            return;
+        }
+
+        const job = await response.json();
+        console.log(`[sondeo] Trabajo recibido: documento ${job.documentId}`);
+        await procesarTrabajo(job);
+    } catch (error) {
+        // Backend caido o sin red: se reintenta en el siguiente ciclo.
+        console.warn(`[sondeo] ${error.message}`);
+    } finally {
+        sondeando = false;
+    }
+}
 
 // 4001 es el puerto que espera WORKER_URL en la configuración del backend.
 const PORT = process.env.PORT || 4001;
@@ -167,4 +212,8 @@ app.listen(PORT, async () => {
         console.warn(`ATENCION: el LLM local no responde — ${llm.reason}`);
         console.warn('El worker va a caer al clasificador por keywords hasta que Ollama esté arriba.');
     }
+
+    console.log(`Sondeando ${JOBS_URL} cada ${POLL_MS / 1000}s`);
+    setInterval(sondearTrabajo, POLL_MS);
+    void sondearTrabajo();
 });
