@@ -9,7 +9,15 @@ dotenv.config();
 const app = express();
 app.use(express.json({ limit: '15mb' }));
 
-const BACKEND_WEBHOOK_URL = process.env.BACKEND_URL + '/webhooks/worker-update';
+// Las rutas del backend se montan en /api (backend/src/app.js), asi que el
+// webhook vive en /api/webhooks/worker-update. Se acepta BACKEND_URL con o sin
+// el /api final: sin esto el worker manda los estados a un 404 y el usuario ve
+// el analisis congelado sin ningun error visible.
+const BACKEND_BASE = String(process.env.BACKEND_URL || '')
+    .replace(/\/+$/, '')
+    .replace(/\/api$/, '');
+
+const BACKEND_WEBHOOK_URL = BACKEND_BASE + '/api/webhooks/worker-update';
 
 // La llave se valida al arrancar: si está mal, es mejor no levantar el worker
 // que aceptar documentos y fallar al descifrarlos uno por uno.
@@ -59,11 +67,38 @@ app.get('/health', async (_req, res) => {
     });
 });
 
-app.post('/api/analyze', async (req, res) => {
-    // AHORA RECIBIMOS LOS SUBCRITERIOS DIRECTAMENTE DESDE EL SERVICIO A
-    const { documentId, userId, iv, authTag, fileData, subcriteria, format } = req.body;
+// El worker se publica por un tunel para que Railway lo alcance, asi que
+// /api/analyze queda expuesto a internet. El payload va cifrado, pero sin
+// token cualquiera puede encolar trabajo en la GPU y provocar webhooks.
+function requireWorkerToken(req, res, next) {
+    const esperado = process.env.WORKER_API_TOKEN;
 
+    if (!esperado) {
+        console.warn('WORKER_API_TOKEN no definido: /api/analyze esta SIN autenticacion.');
+        return next();
+    }
+
+    const recibido = req.headers['x-worker-token'];
+
+    if (typeof recibido !== 'string' || recibido.length !== esperado.length) {
+        return res.status(401).json({ error: 'No autorizado' });
+    }
+
+    if (!crypto.timingSafeEqual(Buffer.from(recibido), Buffer.from(esperado))) {
+        return res.status(401).json({ error: 'No autorizado' });
+    }
+
+    return next();
+}
+
+app.post('/api/analyze', requireWorkerToken, async (req, res) => {
     res.status(202).json({ message: 'Documento en procesamiento' });
+    await procesarTrabajo(req.body);
+});
+
+/** Descifra, extrae, clasifica y reporta. Compartido por el bucle y el POST. */
+async function procesarTrabajo(job) {
+    const { documentId, userId, iv, authTag, fileData, subcriteria, format } = job;
 
     try {
         await sendStatusUpdate(documentId, 'RECEIVED_BY_ANALYZER');
@@ -115,7 +150,76 @@ app.post('/api/analyze', async (req, res) => {
         console.error("Error en el Worker:", error);
         await sendStatusUpdate(documentId, 'ERROR', { error: error.message });
     }
-});
+}
+
+// ─── Bucle de sondeo ──────────────────────────────────────────────────────────
+//
+// El worker pregunta al backend si hay trabajo en vez de esperar conexiones.
+// Asi esta maquina no necesita IP estable, puertos abiertos, tunel ni VPN: solo
+// salida HTTPS, que cualquier conexion domestica tiene.
+
+// El backend despacha por push (POST /api/analyze), asi que el sondeo ya no es
+// la via principal: queda como red de seguridad para los documentos que se
+// encolaron mientras esta maquina estaba apagada o sin red, que de otro modo
+// se quedarian esperando sin que nadie los recoja.
+//
+// Por eso el ritmo de reposo es lento: un minuto basta para recuperarlos, y son
+// ~1.400 peticiones diarias en vez de 17.000.
+const POLL_MIN_MS = Number(process.env.WORKER_POLL_MS || 2000);
+const POLL_MAX_MS = Number(process.env.WORKER_POLL_MAX_MS || 60000);
+
+// Cuanto se sigue sondeando rapido despues del ultimo trabajo.
+const POLL_ACTIVE_MS = Number(process.env.WORKER_POLL_ACTIVE_MS || 120000);
+
+const JOBS_URL = BACKEND_BASE + '/api/worker/jobs';
+
+let sondeando = false;
+// Arranca en modo activo: un worker recien encendido suele serlo porque
+// alguien va a usarlo. Con 0 entraba directo al ritmo de reposo y el primer
+// documento esperaba hasta 30s.
+let ultimoTrabajo = Date.now();
+
+function intervaloActual() {
+    return Date.now() - ultimoTrabajo < POLL_ACTIVE_MS ? POLL_MIN_MS : POLL_MAX_MS;
+}
+
+function programarSondeo() {
+    setTimeout(async () => {
+        await sondearTrabajo();
+        programarSondeo();
+    }, intervaloActual());
+}
+
+async function sondearTrabajo() {
+    // Un solo documento a la vez: la GPU no gana nada procesando en paralelo.
+    if (sondeando) return;
+    sondeando = true;
+
+    try {
+        const response = await fetch(JOBS_URL, {
+            headers: { 'x-worker-token': process.env.WORKER_API_TOKEN || '' },
+            signal: AbortSignal.timeout(60000),
+        });
+
+        // 204: no hay trabajo. Es el caso normal, no se registra.
+        if (response.status === 204) return;
+
+        if (!response.ok) {
+            console.warn(`[sondeo] El backend respondio ${response.status}`);
+            return;
+        }
+
+        const job = await response.json();
+        ultimoTrabajo = Date.now();
+        console.log(`[sondeo] Trabajo recibido: documento ${job.documentId}`);
+        await procesarTrabajo(job);
+    } catch (error) {
+        // Backend caido o sin red: se reintenta en el siguiente ciclo.
+        console.warn(`[sondeo] ${error.message}`);
+    } finally {
+        sondeando = false;
+    }
+}
 
 // 4001 es el puerto que espera WORKER_URL en la configuración del backend.
 const PORT = process.env.PORT || 4001;
@@ -136,4 +240,11 @@ app.listen(PORT, async () => {
         console.warn(`ATENCION: el LLM local no responde — ${llm.reason}`);
         console.warn('El worker va a caer al clasificador por keywords hasta que Ollama esté arriba.');
     }
+
+    console.log(
+        `Sondeando ${JOBS_URL} cada ${POLL_MIN_MS / 1000}s con actividad, ` +
+        `${POLL_MAX_MS / 1000}s en reposo`
+    );
+    void sondearTrabajo();
+    programarSondeo();
 });
