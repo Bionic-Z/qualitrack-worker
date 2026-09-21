@@ -12,7 +12,7 @@
 // documentos nunca se bloquea por un servicio de IA caído.
 
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
-import { generateStructured } from './llm.service.js';
+import { generateStructured, LLM_MODEL } from './llm.service.js';
 
 // ─── Fallback: clasificador determinístico por keywords ───────────────────────
 
@@ -54,6 +54,7 @@ function classifyByKeywords(text, subcriteria) {
         'La propuesta automática indica que el documento NO sería relevante; revíselo manualmente.',
       evidenceFragment: null,
       matchedKeywords: [],
+      engine: 'keywords',
     };
   }
 
@@ -70,6 +71,7 @@ const fragment = findFragment(text, best.matched[0]);
       (fragment ? ` Fragmento detectado: "${fragment}".` : ''),
     evidenceFragment: fragment,
     matchedKeywords: best.matched,
+    engine: 'keywords',
   };
 }
 
@@ -154,7 +156,7 @@ Instrucciones:
  * Compartida por ambos proveedores para que un cambio de motor no altere la
  * forma del resultado.
  */
-function toResult(parsed, text, subcriteria) {
+function toResult(parsed, text, subcriteria, engine) {
   if (!parsed.relevant) {
     return {
       relevant: false,
@@ -164,6 +166,7 @@ function toResult(parsed, text, subcriteria) {
       justification: parsed.justification,
       evidenceFragment: null,
       matchedKeywords: [],
+      engine,
     };
   }
 
@@ -195,6 +198,7 @@ function toResult(parsed, text, subcriteria) {
     justification: parsed.justification,
     evidenceFragment,
     matchedKeywords: [],
+    engine,
   };
 }
 
@@ -207,7 +211,7 @@ async function classifyByLocalLLM(text, subcriteria) {
     schema: LOCAL_RESPONSE_SCHEMA,
   });
 
-  return toResult(parsed, text, subcriteria);
+  return toResult(parsed, text, subcriteria, LLM_MODEL);
 }
 
 // ─── Clasificador con Gemini ──────────────────────────────────────────────────
@@ -233,7 +237,7 @@ Determina si es evidencia relevante para el Criterio 9 y cual subcriterio aplica
   const result = await model.generateContent(prompt);
   const parsed = JSON.parse(result.response.text());
 
-  return toResult(parsed, text, subcriteria);
+  return toResult(parsed, text, subcriteria, 'gemini-2.5-flash');
 }
 
 // ─── Punto de entrada principal ──────────────────────────────────────
