@@ -12,7 +12,7 @@
 // documentos nunca se bloquea por un servicio de IA caído.
 
 import { GoogleGenerativeAI, SchemaType } from '@google/generative-ai';
-import { generateStructured } from './llm.service.js';
+import { generateStructured, LLM_MODEL } from './llm.service.js';
 
 // ─── Fallback: clasificador determinístico por keywords ───────────────────────
 
@@ -54,6 +54,7 @@ function classifyByKeywords(text, subcriteria) {
         'La propuesta automática indica que el documento NO sería relevante; revíselo manualmente.',
       evidenceFragment: null,
       matchedKeywords: [],
+      engine: 'keywords',
     };
   }
 
@@ -70,6 +71,7 @@ const fragment = findFragment(text, best.matched[0]);
       (fragment ? ` Fragmento detectado: "${fragment}".` : ''),
     evidenceFragment: fragment,
     matchedKeywords: best.matched,
+    engine: 'keywords',
   };
 }
 
@@ -130,6 +132,11 @@ function buildInstructions(subcriteria) {
     )
     .join('\n');
 
+  // El ejemplo se toma de los subcriterios reales. Estaba escrito a mano como
+  // "9.1", heredado de la taxonomia anterior, y el modelo obedecia: devolvia
+  // codigos de dos niveles que no existian, y toResult caia a keywords.
+  const ejemplo = subcriteria[0]?.code ?? '9.1.1';
+
   return `Eres un experto en acreditación universitaria chilena (CNA).
 Analizas documentos y determinas si son evidencia relevante para el Criterio 9 "Aseguramiento de la calidad de los programas formativos".
 
@@ -137,7 +144,7 @@ SUBCRITERIOS DISPONIBLES:
 ${subcriteriaList}
 
 Instrucciones:
-- Si el documento es relevante para el Criterio 9, indica cuál subcriterio aplica mejor (usa el código exacto, ej: "9.1").
+- Si el documento es relevante para el Criterio 9, indica cuál subcriterio aplica mejor. Usa el código EXACTO tal como aparece arriba, por ejemplo "${ejemplo}". No lo abrevies ni lo acortes.
 - Si no es relevante para ningún subcriterio, pon relevant=false y subcriterionCode=null.
 - La justificación debe estar en español, ser concisa (2-3 oraciones) y explicar POR QUÉ el documento corresponde a ese subcriterio.
 - El evidenceFragment debe ser una cita textual y literal del documento (máx 200 caracteres) que respalde la decisión. Cópiala del texto, no la parafrasees. Solo pon null si el documento no es relevante.
@@ -149,7 +156,7 @@ Instrucciones:
  * Compartida por ambos proveedores para que un cambio de motor no altere la
  * forma del resultado.
  */
-function toResult(parsed, text, subcriteria) {
+function toResult(parsed, text, subcriteria, engine) {
   if (!parsed.relevant) {
     return {
       relevant: false,
@@ -159,13 +166,21 @@ function toResult(parsed, text, subcriteria) {
       justification: parsed.justification,
       evidenceFragment: null,
       matchedKeywords: [],
+      engine,
     };
   }
 
   const matched = subcriteria.find((s) => s.code === parsed.subcriterionCode);
 
   if (!matched) {
-    // El modelo devolvió un código inexistente — cae a keywords.
+    // El modelo devolvió un código que no está en la lista. Caer a keywords sin
+    // decir nada hacía indistinguible este caso de una clasificación normal: el
+    // resultado se veía correcto pero la IA no había decidido nada.
+    console.warn(
+      `[classifier] El modelo devolvió "${parsed.subcriterionCode}", que no está ` +
+      `entre los subcriterios disponibles (${subcriteria.map((s) => s.code).join(', ')}). ` +
+      'Se usa el clasificador por keywords.'
+    );
     return classifyByKeywords(text, subcriteria);
   }
 
@@ -183,6 +198,7 @@ function toResult(parsed, text, subcriteria) {
     justification: parsed.justification,
     evidenceFragment,
     matchedKeywords: [],
+    engine,
   };
 }
 
@@ -195,7 +211,7 @@ async function classifyByLocalLLM(text, subcriteria) {
     schema: LOCAL_RESPONSE_SCHEMA,
   });
 
-  return toResult(parsed, text, subcriteria);
+  return toResult(parsed, text, subcriteria, LLM_MODEL);
 }
 
 // ─── Clasificador con Gemini ──────────────────────────────────────────────────
@@ -221,7 +237,7 @@ Determina si es evidencia relevante para el Criterio 9 y cual subcriterio aplica
   const result = await model.generateContent(prompt);
   const parsed = JSON.parse(result.response.text());
 
-  return toResult(parsed, text, subcriteria);
+  return toResult(parsed, text, subcriteria, 'gemini-2.5-flash');
 }
 
 // ─── Punto de entrada principal ──────────────────────────────────────
