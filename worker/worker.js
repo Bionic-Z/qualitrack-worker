@@ -158,12 +158,15 @@ async function procesarTrabajo(job) {
 // Asi esta maquina no necesita IP estable, puertos abiertos, tunel ni VPN: solo
 // salida HTTPS, que cualquier conexion domestica tiene.
 
-// Sondeo adaptativo: rapido mientras hay actividad, lento cuando no la hay.
-// A intervalo fijo de 5s son ~17.000 peticiones diarias, casi todas contra una
-// cola vacia. Asi se bajan a unas 3.000 sin empeorar la latencia cuando
-// realmente se esta usando: tras encontrar trabajo se vuelve al ritmo rapido.
+// El backend despacha por push (POST /api/analyze), asi que el sondeo ya no es
+// la via principal: queda como red de seguridad para los documentos que se
+// encolaron mientras esta maquina estaba apagada o sin red, que de otro modo
+// se quedarian esperando sin que nadie los recoja.
+//
+// Por eso el ritmo de reposo es lento: un minuto basta para recuperarlos, y son
+// ~1.400 peticiones diarias en vez de 17.000.
 const POLL_MIN_MS = Number(process.env.WORKER_POLL_MS || 2000);
-const POLL_MAX_MS = Number(process.env.WORKER_POLL_MAX_MS || 30000);
+const POLL_MAX_MS = Number(process.env.WORKER_POLL_MAX_MS || 60000);
 
 // Cuanto se sigue sondeando rapido despues del ultimo trabajo.
 const POLL_ACTIVE_MS = Number(process.env.WORKER_POLL_ACTIVE_MS || 120000);
