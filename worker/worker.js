@@ -158,10 +158,34 @@ async function procesarTrabajo(job) {
 // Asi esta maquina no necesita IP estable, puertos abiertos, tunel ni VPN: solo
 // salida HTTPS, que cualquier conexion domestica tiene.
 
-const POLL_MS = Number(process.env.WORKER_POLL_MS || 5000);
+// Sondeo adaptativo: rapido mientras hay actividad, lento cuando no la hay.
+// A intervalo fijo de 5s son ~17.000 peticiones diarias, casi todas contra una
+// cola vacia. Asi se bajan a unas 3.000 sin empeorar la latencia cuando
+// realmente se esta usando: tras encontrar trabajo se vuelve al ritmo rapido.
+const POLL_MIN_MS = Number(process.env.WORKER_POLL_MS || 2000);
+const POLL_MAX_MS = Number(process.env.WORKER_POLL_MAX_MS || 30000);
+
+// Cuanto se sigue sondeando rapido despues del ultimo trabajo.
+const POLL_ACTIVE_MS = Number(process.env.WORKER_POLL_ACTIVE_MS || 120000);
+
 const JOBS_URL = BACKEND_BASE + '/api/worker/jobs';
 
 let sondeando = false;
+// Arranca en modo activo: un worker recien encendido suele serlo porque
+// alguien va a usarlo. Con 0 entraba directo al ritmo de reposo y el primer
+// documento esperaba hasta 30s.
+let ultimoTrabajo = Date.now();
+
+function intervaloActual() {
+    return Date.now() - ultimoTrabajo < POLL_ACTIVE_MS ? POLL_MIN_MS : POLL_MAX_MS;
+}
+
+function programarSondeo() {
+    setTimeout(async () => {
+        await sondearTrabajo();
+        programarSondeo();
+    }, intervaloActual());
+}
 
 async function sondearTrabajo() {
     // Un solo documento a la vez: la GPU no gana nada procesando en paralelo.
@@ -183,6 +207,7 @@ async function sondearTrabajo() {
         }
 
         const job = await response.json();
+        ultimoTrabajo = Date.now();
         console.log(`[sondeo] Trabajo recibido: documento ${job.documentId}`);
         await procesarTrabajo(job);
     } catch (error) {
@@ -213,7 +238,10 @@ app.listen(PORT, async () => {
         console.warn('El worker va a caer al clasificador por keywords hasta que Ollama esté arriba.');
     }
 
-    console.log(`Sondeando ${JOBS_URL} cada ${POLL_MS / 1000}s`);
-    setInterval(sondearTrabajo, POLL_MS);
+    console.log(
+        `Sondeando ${JOBS_URL} cada ${POLL_MIN_MS / 1000}s con actividad, ` +
+        `${POLL_MAX_MS / 1000}s en reposo`
+    );
     void sondearTrabajo();
+    programarSondeo();
 });
