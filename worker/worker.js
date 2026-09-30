@@ -91,7 +91,36 @@ function requireWorkerToken(req, res, next) {
     return next();
 }
 
-app.post('/api/analyze', requireWorkerToken, async (req, res) => {
+function origen(url) {
+    try {
+        return new URL(url).origin;
+    } catch {
+        return null;
+    }
+}
+
+// Los webhooks van siempre a BACKEND_URL, no a quien envio el trabajo. Si un
+// backend distinto (tipicamente uno local apuntando a este worker) manda un
+// documento, sus estados y su propuesta se escribirian en el documento con el
+// mismo id del backend de BACKEND_URL. Se rechaza antes de tocar nada.
+// Un backend antiguo que no manda backendUrl se sigue aceptando.
+function requireSameBackend(req, res, next) {
+    const declarado = req.body?.backendUrl;
+    if (!declarado) return next();
+
+    if (origen(declarado) !== origen(BACKEND_BASE)) {
+        console.warn(`[analyze] Trabajo rechazado: viene de ${declarado}, este worker reporta a ${BACKEND_BASE}`);
+        return res.status(409).json({
+            error:
+                `El worker de WORKER_URL reporta a ${BACKEND_BASE}, no a ${declarado}. ` +
+                'Levanta un worker propio con BACKEND_URL apuntando a este backend.',
+        });
+    }
+
+    return next();
+}
+
+app.post('/api/analyze', requireWorkerToken, requireSameBackend, async (req, res) => {
     res.status(202).json({ message: 'Documento en procesamiento' });
     await procesarTrabajo(req.body);
 });
